@@ -138,5 +138,16 @@ problems or report it on the deadlocker.net Discord.
 
 ---
 
+## Credits
+
+The actual scanning and repair work is done by **[vpkmerge](https://github.com/Slush97/vpkmerge)**
+by [Slush97](https://github.com/Slush97). The Mod Fixer is a wrapper around it: it runs vpkmerge's
+`attachments check` and `attachments heal` commands for you, then verifies, backs up and
+installs the result. The Mod Fixer currently bundles vpkmerge
+[v0.22.1](https://github.com/Slush97/vpkmerge/releases/tag/v0.22.1). All credit for the VPK
+parsing and attachment-healing logic goes to its author.
+
+---
+
 *Deadlocker is a community project dedicated to documenting and showcasing all available skins and
 community-created mods for Deadlock. — [deadlocker.net](https://deadlocker.net)*
