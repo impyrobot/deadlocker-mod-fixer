@@ -1,0 +1,47 @@
+# Builds DeadlockModFixer.exe from source on GitHub's Windows runners, so every release binary
+# is reproducible from this repository. SignPath code signing will be added as a step here.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate C# compiler and .NET Framework reference assemblies
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          $csc = Join-Path $vs 'MSBuild\Current\Bin\Roslyn\csc.exe'
+          $refs = Get-ChildItem "${env:ProgramFiles(x86)}\Reference Assemblies\Microsoft\Framework\.NETFramework" -Directory |
+                  Where-Object { Test-Path (Join-Path $_.FullName 'System.Windows.Forms.dll') } |
+                  Sort-Object Name | Select-Object -First 1 -ExpandProperty FullName
+          if (-not (Test-Path $csc)) { throw "csc.exe not found under $vs" }
+          if (-not $refs) { throw ".NET Framework reference assemblies not found" }
+          "Using $csc"; "Using $refs"
+          "CSC=$csc"   >> $env:GITHUB_ENV
+          "REFS=$refs" >> $env:GITHUB_ENV
+
+      - name: Build
+        shell: cmd
+        run: GUI\build.bat
+
+      - name: SHA-256
+        shell: pwsh
+        run: (Get-FileHash DeadlockModFixer.exe -Algorithm SHA256).Hash.ToLower()
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DeadlockModFixer-${{ github.ref_name }}
+          path: DeadlockModFixer.exe
+          if-no-files-found: error

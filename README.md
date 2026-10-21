@@ -43,3 +43,41 @@ For the optional offline zip, put the official
 The scanning and repair are done by [vpkmerge](https://github.com/Slush97/vpkmerge) by
 [Slush97](https://github.com/Slush97). This tool runs the official, unmodified vpkmerge v0.22.1 behind a GUI that adds
 verification, backups and installation.
+
+## Privacy
+
+The fixer sends no personal data, telemetry or analytics, and has no accounts. It only connects to
+GitHub, for two things:
+
+- **Update check:** when it starts, it asks the GitHub releases API for the latest version of this
+  project.
+- **vpkmerge download:** if `vpkmerge.exe` isn't next to the app, it downloads the official v0.22.1
+  release from [github.com/Slush97/vpkmerge](https://github.com/Slush97/vpkmerge) and checks its
+  SHA-256 before running it.
+
+These are ordinary HTTPS requests to github.com, so GitHub sees your IP address and a `User-Agent`
+naming the fixer and its version. GitHub's [privacy statement](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement)
+applies to those requests. Nothing else leaves your PC. The fixer only modifies files in your
+Deadlock addons folder and its own folder under `%LocalAppData%\DeadlockerModFixer\`.
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by
+[SignPath Foundation](https://signpath.org/). *(Application pending. Current releases are unsigned.)*
+
+- Release binaries are built from this repository's source by GitHub Actions
+  ([`.github/workflows/build.yml`](.github/workflows/build.yml)).
+- Only `DeadlockModFixer.exe` is signed. vpkmerge is a separate upstream binary and is never signed
+  by this project.
+- Every signing request is manually approved.
+
+**Team roles**
+
+- Committers and reviewers: [impyrobot](https://github.com/impyrobot)
+- Approvers: [impyrobot](https://github.com/impyrobot)
+
+Changes from people outside the team (pull requests) are reviewed by a team member before merging.
+
+## License
+
+[MIT](LICENSE). vpkmerge is a separate project by Slush97 under its own license.
