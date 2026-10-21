@@ -42,8 +42,26 @@ one click.
 
 ## Download
 
-[Download DeadlockModFixer.exe](https://deadlocker.net) from deadlocker.net. It's a single file —
-no installer, nothing else to download.
+[Download DeadlockModFixer.exe](https://deadlocker.net) from deadlocker.net. It's a single small
+file, with no installer.
+
+The actual repair is done by the official, unmodified [vpkmerge v0.22.1](https://github.com/Slush97/vpkmerge/releases/tag/v0.22.1)
+by Slush97. The first time you scan, the fixer downloads it from Slush97's GitHub page (about 9 MB,
+a few seconds). It checks the file's fingerprint (SHA-256) before every run and refuses to use any
+other copy. After that, it works offline.
+
+> **No internet on the PC you game on?** Download the zip from the
+> [GitHub release page](https://github.com/impyrobot/deadlocker-mod-fixer/releases) instead. It
+> includes both files. Right-click it → **Extract All**, then run the exe from the extracted folder.
+
+Want to verify the download? These are the SHA-256 fingerprints:
+
+| File | SHA-256 |
+|------|---------|
+| DeadlockModFixer.exe (v1.1.0) | `21a47dbc23f551e96b58b3823a586b27b3214711be98a444d559c0c982f12636` |
+| vpkmerge.exe (v0.22.1) | `b4a5d0e3a3a1d4e627cb4979216807295351c7fb38e5a3aa6345b213a5c69275` |
+
+In PowerShell: `Get-FileHash .\DeadlockModFixer.exe`
 
 > **Windows SmartScreen warning:** Because the tool isn't code-signed, Windows may show a
 > "Windows protected your PC" dialog the first time you open it. Click **More info**, then
@@ -69,13 +87,14 @@ If the path isn't detected (for example, if Deadlock is installed on a secondary
 
 ## Step 2 — Scan your mods
 
-Click **Scan Mods**. The tool checks every mod in your addons folder and colour-codes the results:
+Click **Scan Mods**. The tool checks every mod in your addons folder, shows which hero each skin
+is for, and colour-codes the results:
 
 | Colour | Meaning |
 |--------|---------|
 | Green  | Current — this mod is fine, no action needed |
 | Yellow | Stale — this mod has broken camera attachments and needs fixing |
-| Grey   | Skipped — this mod uses chunk files and can't be auto-fixed (rare) |
+| Grey   | Skipped — this mod is split across multiple files, which isn't supported yet |
 | Red    | Error — something unexpected happened, check the log panel |
 
 The scan is read-only. Nothing is changed at this stage.
@@ -101,9 +120,9 @@ isn't confident about.
 
 ## Restoring a backup
 
-If anything looks wrong after fixing, click **Scan Mods** again to check the current state, or
-restore your originals from the backup folder. The tool tells you the exact backup path after
-every fix run.
+If anything looks wrong after fixing, click **Restore Backup…**, pick the backup from the list
+(newest first), and click **Restore**. Your original files are copied back and the tool rescans
+automatically.
 
 For the PowerShell-savvy: the included `FixMods.ps1` script also supports a `-Restore` flag:
 
@@ -128,8 +147,13 @@ Yes, and you won't need to fix it — author-released updates are already correc
 as normal.
 
 **A mod shows as Skipped. What does that mean?**
-A small number of mods are distributed as multi-part VPK packages (chunk files). The fixer can't
-safely repair these automatically. You'll need to wait for the author to release an update for those.
+Some mods are split across multiple files (`pak07_dir.vpk` plus `pak07_000.vpk`, `pak07_001.vpk`…).
+The fixer doesn't support these yet, so it leaves them untouched. Check the mod page on
+deadlocker.net for an update from the author.
+
+**Something went wrong. How do I report it?**
+Click **Copy Report** and paste it into your post on Reddit, GitHub or the deadlocker.net Discord.
+It includes the scan results and log we need to help.
 
 **The tool fixed a mod but it still looks wrong in game.**
 Restart Deadlock fully (not just a map change) after running the fixer. If it still looks wrong,
@@ -143,7 +167,7 @@ problems or report it on the deadlocker.net Discord.
 The actual scanning and repair work is done by **[vpkmerge](https://github.com/Slush97/vpkmerge)**
 by [Slush97](https://github.com/Slush97). The Mod Fixer is a wrapper around it: it runs vpkmerge's
 `attachments check` and `attachments heal` commands for you, then verifies, backs up and
-installs the result. The Mod Fixer currently bundles vpkmerge
+installs the result. The Mod Fixer runs the official, unmodified vpkmerge
 [v0.22.1](https://github.com/Slush97/vpkmerge/releases/tag/v0.22.1). All credit for the VPK
 parsing and attachment-healing logic goes to its author.
 

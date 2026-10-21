@@ -4,8 +4,9 @@ Staging/
 *.log
 *.vpk
 
-# Binaries (build output + third-party vpkmerge; publish via Releases)
+# Binaries and release zips (build output + third-party vpkmerge; publish via Releases)
 *.exe
 
 # Claude Code local settings
 .claude/
+*.zip

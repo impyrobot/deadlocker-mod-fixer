@@ -308,7 +308,7 @@ foreach ($mod in $modFiles) {
 
     # Skip mods with chunk siblings
     if ($chunkedNums.ContainsKey($pakNum)) {
-        $reason = "has sibling chunk files (pak${pakNum}_000.vpk etc.)"
+        $reason = "split across multiple files (pak${pakNum}_000.vpk etc.), not supported yet"
         Write-Log "  SKIPPED: $reason" 'Yellow'
         $results.Add([PSCustomObject]@{
             Mod         = $mod.Name

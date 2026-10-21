@@ -8,7 +8,7 @@ set REFS=C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFra
 echo Building DeadlockModFixer.exe ...
 echo.
 
-%CSC% /target:winexe /out:"..\DeadlockModFixer.exe" /reference:"%REFS%\System.Windows.Forms.dll" /reference:"%REFS%\System.Drawing.dll" /reference:"%REFS%\System.Core.dll" /resource:"..\vpkmerge.exe,Resources.vpkmerge.exe" /resource:"..\image.png,Resources.logo.png" /langversion:6 Program.cs
+%CSC% /target:winexe /out:"..\DeadlockModFixer.exe" /reference:"%REFS%\System.Windows.Forms.dll" /reference:"%REFS%\System.Drawing.dll" /reference:"%REFS%\System.Core.dll" /resource:..\image.png,Resources.logo.png /langversion:6 Program.cs
 
 if %ERRORLEVEL% EQU 0 (
     echo.

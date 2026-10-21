@@ -9,15 +9,255 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("Deadlocker Mod Fixer")]
 [assembly: AssemblyProduct("Deadlocker Mod Fixer")]
-[assembly: AssemblyVersion("1.0.0.0")]
+[assembly: AssemblyVersion(AppInfo.Version + ".0")]
+
+static class AppInfo
+{
+    public const string Version     = "1.1.0";
+    public const string Repo        = "impyrobot/deadlocker-mod-fixer";
+    public const string ReleasesUrl = "https://github.com/" + Repo + "/releases/latest";
+    public const string SiteUrl     = "https://deadlocker.net";
+
+    // GitHub requires TLS 1.2; .NET 4.0 refs don't name it, so use the raw value
+    public static void EnableTls12()
+    {
+        ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hero names - maps model folder codenames to the names players know.
+// Display names match deadlocker.net's character_list.py.
+// Update both lists when new heroes are added to the game.
+// ---------------------------------------------------------------------------
+static class HeroNames
+{
+    // Codenames that differ from the display name (internal name -> display name)
+    private static readonly Dictionary<string, string> Codenames =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        { "archer",     "Grey Talon" },  { "orion",    "Grey Talon" },
+        { "astro",      "Holliday" },
+        { "atlas",      "Abrams" },
+        { "bookworm",   "Paige" },
+        { "chrono",     "Paradox" },
+        { "digger",     "Mo & Krill" },
+        { "engineer",   "McGinnis" },
+        { "familiar",   "Rem" },
+        { "fencer",     "Apollo" },
+        { "forge",      "McGinnis" },
+        { "frank",      "Victor" },
+        { "ghost",      "Lady Geist" },
+        { "gigawatt",   "Seven" },
+        { "hornet",     "Vindicta" },
+        { "inferno",    "Infernus" },
+        { "magician",   "Sinclair" },
+        { "nano",       "Calico" },
+        { "necro",      "Graves" },
+        { "priest",     "Venator" },
+        { "punkgoat",   "Billy" },
+        { "synth",      "Pocket" },
+        { "tengu",      "Ivy" },
+        { "unicorn",    "Celeste" },
+        { "vampirebat", "Mina" },
+        { "viper",      "Vyper" },
+        { "werewolf",   "Silver" },
+    };
+
+    private static readonly string[] Display =
+    {
+        "Abrams", "Bebop", "Billy", "Calico", "Drifter", "Dynamo", "Fathom", "Grey Talon",
+        "Haze", "Holliday", "Infernus", "Ivy", "Kelvin", "Lady Geist", "Lash", "Magician",
+        "McGinnis", "Mina", "Mirage", "Mo & Krill", "Paige", "Paradox", "Pocket", "Raven",
+        "Seven", "Shiv", "Sinclair", "The Doorman", "Trapper", "Victor", "Vindicta", "Viper",
+        "Viscous", "Vyper", "Warden", "Wraith", "Wrecker", "Yamato",
+        "Graves", "Rem", "Silver", "Venator", "Apollo", "Celeste", "Deadman Danny",
+        "Rat King", "Solomon", "Violet", "Nurse Harrow", "Baba",
+    };
+
+    // Where hero codenames show up in mod file paths:
+    //   models/heroes_wip/haze/..., materials/models/heroes_staging/yamato_v2/...  (strongest signal)
+    //   panorama/images/heroes/inferno_card_psd.vtex_c
+    //   particles/abilities/lash/..., sounds/weapons/inferno/..., particles/abilities/melee/viscous/...
+    private static readonly Regex HeroFolder =
+        new Regex(@"(?:^|/)heroes[^/]*/([^/]+)/", RegexOptions.IgnoreCase);
+    private static readonly Regex HeroCard =
+        new Regex(@"^panorama/images/heroes/([a-z]+)_", RegexOptions.IgnoreCase);
+    private static readonly Regex HeroAssets =
+        new Regex(@"^(?:particles|sounds|soundevents)/", RegexOptions.IgnoreCase);
+
+    // Hero name for a mod, or what kind of mod it is when no hero is found
+    public static string Describe(IList<string> paths)
+    {
+        var hero = FromFiles(paths);
+        return hero != "" ? hero : ModType(paths);
+    }
+
+    // Hero most referenced by a mod's file paths, or "" if none
+    public static string FromFiles(IEnumerable<string> paths)
+    {
+        var votes = new Dictionary<string, int>();
+        foreach (var raw in paths)
+        {
+            var p = raw.Replace('\\', '/');
+
+            var m = HeroFolder.Match(p);
+            if (m.Success)
+            {
+                // A hero folder is authoritative, so name even heroes we don't know yet
+                var code = m.Groups[1].Value;
+                Vote(votes, Resolve(code) ?? Capitalize(Regex.Replace(code, @"_v\d+$", "")), 3);
+                continue;
+            }
+
+            m = HeroCard.Match(p);
+            if (m.Success) { Vote(votes, Resolve(m.Groups[1].Value), 1); continue; }
+
+            // Effects/sounds: the first folder that is a known hero codename
+            if (HeroAssets.IsMatch(p))
+            {
+                var segs = p.Split('/');
+                for (int i = 1; i < segs.Length - 1; i++)
+                {
+                    var h = Resolve(segs[i]);
+                    if (h != null) { Vote(votes, h, 1); break; }
+                }
+            }
+        }
+        if (votes.Count == 0) return "";
+
+        // Effects/sound packs touching many heroes: naming just one would mislead
+        var top = votes.OrderByDescending(kv => kv.Value).First();
+        if (votes.Count >= 3 && top.Value * 2 < votes.Values.Sum()) return "(multi-hero pack)";
+        return top.Key;
+    }
+
+    // Known hero for a codename, trying variants (yamato_v2, wraith_gen_man, werewolf_wolf), else null
+    private static string Resolve(string code)
+    {
+        code = Regex.Replace(code, @"_v\d+$", "");
+        while (code.Length > 0)
+        {
+            var name = Known(code);
+            if (name != null) return name;
+            var cut = code.LastIndexOf('_');
+            if (cut <= 0) break;
+            code = code.Substring(0, cut);
+        }
+        return null;
+    }
+
+    private static string Known(string code)
+    {
+        string name;
+        if (Codenames.TryGetValue(code, out name)) return name;
+        var key = Squash(code);
+        return Display.FirstOrDefault(d => Squash(d) == key || Squash(d) == "the" + key);
+    }
+
+    private static void Vote(Dictionary<string, int> votes, string hero, int weight)
+    {
+        if (string.IsNullOrEmpty(hero)) return;
+        int n;
+        votes.TryGetValue(hero, out n);
+        votes[hero] = n + weight;
+    }
+
+    private static string Capitalize(string s)
+    {
+        return s.Length == 0 ? s : char.ToUpperInvariant(s[0]) + s.Substring(1);
+    }
+
+    // Label for mods with no hero files, from the folder most of their files live in
+    private static string ModType(IList<string> paths)
+    {
+        var biggest = paths
+            .Select(p => p.Replace('\\', '/').Split('/')[0].ToLowerInvariant())
+            .Select(top =>
+                top == "sounds" || top == "soundevents" ? "(sound mod)" :
+                top == "panorama"                       ? "(UI mod)" :
+                top == "particles"                      ? "(effects mod)" :
+                top == "models" || top == "materials"   ? "(map/props mod)" : null)
+            .Where(t => t != null)
+            .GroupBy(t => t)
+            .OrderByDescending(g => g.Count())
+            .FirstOrDefault();
+
+        // Only label it when that kind of file is a real share of the mod
+        return biggest != null && biggest.Count() * 3 >= paths.Count ? biggest.Key : "(other)";
+    }
+
+    private static string Squash(string s)
+    {
+        return Regex.Replace(s.ToLowerInvariant(), @"[^a-z0-9]", "");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VPK directory reader - lists the files inside a *_dir.vpk (reads only the
+// header and directory tree, never the file data)
+// ---------------------------------------------------------------------------
+static class VpkDir
+{
+    public static List<string> ListFiles(string vpkPath)
+    {
+        var files = new List<string>();
+        using (var fs = File.OpenRead(vpkPath))
+        using (var br = new BinaryReader(fs))
+        {
+            if (br.ReadUInt32() != 0x55AA1234) throw new InvalidDataException("not a VPK file");
+            var version  = br.ReadUInt32();
+            var treeSize = br.ReadUInt32();
+            if (version == 2) br.ReadBytes(16);   // section sizes we don't need
+            else if (version != 1) throw new InvalidDataException("unsupported VPK version " + version);
+
+            var treeEnd = fs.Position + treeSize;
+            while (fs.Position < treeEnd)
+            {
+                var ext = ReadString(br);
+                if (ext == "") break;
+                while (true)
+                {
+                    var dir = ReadString(br);
+                    if (dir == "") break;
+                    while (true)
+                    {
+                        var name = ReadString(br);
+                        if (name == "") break;
+
+                        br.ReadUInt32();                   // CRC
+                        var preload = br.ReadUInt16();
+                        br.ReadBytes(2 + 4 + 4 + 2);       // archive index, offset, length, terminator
+                        if (preload > 0) br.ReadBytes(preload);
+
+                        var file = ext == " " ? name : name + "." + ext;
+                        files.Add(dir == " " ? file : dir + "/" + file);
+                    }
+                }
+            }
+        }
+        return files;
+    }
+
+    private static string ReadString(BinaryReader br)
+    {
+        var bytes = new List<byte>();
+        byte b;
+        while ((b = br.ReadByte()) != 0) bytes.Add(b);
+        return Encoding.UTF8.GetString(bytes.ToArray());
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Data
@@ -31,6 +271,8 @@ class ModEntry
     public ModStatus Status = ModStatus.Pending;
     public string[] StaleModels = new string[0];
     public string StatusDetail = "";
+    public string Hero = "";
+    public bool IsSplit;
 
     public ModEntry(string path)
     {
@@ -40,47 +282,105 @@ class ModEntry
 }
 
 // ---------------------------------------------------------------------------
-// vpkmerge runner - locates/extracts vpkmerge.exe and runs commands
+// vpkmerge runner - locates/downloads vpkmerge.exe (hash-verified) and runs commands
 // ---------------------------------------------------------------------------
 static class VpkMerge
 {
+    // Official vpkmerge v0.22.1 by Slush97, unmodified
+    public const string Version     = "0.22.1";
+    public const string Sha256      = "b4a5d0e3a3a1d4e627cb4979216807295351c7fb38e5a3aa6345b213a5c69275";
+    public const string DownloadUrl =
+        "https://github.com/Slush97/vpkmerge/releases/download/v0.22.1/vpkmerge-windows-x86_64.exe";
+
     private static string _exePath;
+
+    // True once a verified copy has been found; null means not looked yet
+    public static bool? Verified;
 
     public static string ExePath
     {
         get
         {
             if (_exePath != null) return _exePath;
-            _exePath = FindOrExtract();
+            _exePath = FindOrDownload();
+            Verified = true;
             return _exePath;
         }
     }
 
-    private static string FindOrExtract()
+    // Path of the downloaded copy, used when vpkmerge.exe isn't next to the app
+    public static string CachedPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "DeadlockerModFixer", "vpkmerge.exe");
+
+    public static bool NeedsDownload
     {
-        // 1. Look next to the running .exe first (dev convenience)
-        var nextTo = Path.Combine(
-            Path.GetDirectoryName(Application.ExecutablePath), "vpkmerge.exe");
-        if (File.Exists(nextTo)) return nextTo;
-
-        // 2. Extract embedded resource to %LocalAppData%
-        var dir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "DeadlockerModFixer");
-        Directory.CreateDirectory(dir);
-        var dest = Path.Combine(dir, "vpkmerge.exe");
-
-        using (var stream = Assembly.GetExecutingAssembly()
-            .GetManifestResourceStream("Resources.vpkmerge.exe"))
+        get
         {
-            if (stream == null)
-                throw new InvalidOperationException(
-                    "vpkmerge.exe not found next to the application and not embedded. " +
-                    "Place vpkmerge.exe in the same folder as DeadlockModFixer.exe.");
-            using (var fs = File.Create(dest))
-                stream.CopyTo(fs);
+            if (_exePath != null) return false;
+            return !HashMatches(NextToApp) && !HashMatches(CachedPath);
         }
-        return dest;
+    }
+
+    private static string NextToApp => Path.Combine(
+        Path.GetDirectoryName(Application.ExecutablePath), "vpkmerge.exe");
+
+    private static string FindOrDownload()
+    {
+        // 1. Next to the app (shipped in the zip)
+        if (HashMatches(NextToApp)) return NextToApp;
+
+        // 2. Previously downloaded copy
+        var cached = CachedPath;
+        if (HashMatches(cached)) return cached;
+
+        // 3. Download from the official GitHub release, verify, then move into place
+        var nextToExists = File.Exists(NextToApp);
+        var tmp = cached + ".tmp";
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(cached));
+            AppInfo.EnableTls12();
+            var req = (HttpWebRequest)WebRequest.Create(DownloadUrl);
+            req.UserAgent = "DeadlockerModFixer/" + AppInfo.Version;
+            req.Timeout   = 60000;
+            using (var resp = req.GetResponse())
+            using (var src  = resp.GetResponseStream())
+            using (var fs   = File.Create(tmp))
+                src.CopyTo(fs);
+
+            if (!HashMatches(tmp))
+                throw new InvalidOperationException("downloaded file failed the SHA-256 check");
+
+            if (File.Exists(cached)) File.Delete(cached);
+            File.Move(tmp, cached);
+            return cached;
+        }
+        catch (Exception ex)
+        {
+            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+            throw new InvalidOperationException(
+                (nextToExists
+                    ? "The vpkmerge.exe next to the app doesn't match the official v" + Version + " release, so it won't be run.\n\n"
+                    : "") +
+                "Couldn't download vpkmerge (" + ex.Message + ").\n\n" +
+                "Extract the full zip, or put the official vpkmerge.exe v" + Version +
+                " next to DeadlockModFixer.exe:\nhttps://github.com/Slush97/vpkmerge/releases/tag/v" + Version);
+        }
+    }
+
+    public static bool HashMatches(string path)
+    {
+        if (!File.Exists(path)) return false;
+        try { return FileSha256(path) == Sha256; }
+        catch { return false; }
+    }
+
+    public static string FileSha256(string path)
+    {
+        using (var sha = SHA256.Create())
+        using (var fs  = File.OpenRead(path))
+            return BitConverter.ToString(sha.ComputeHash(fs)).Replace("-", "").ToLowerInvariant();
     }
 
     // Run vpkmerge with the given arguments (each passed as a separate element,
@@ -101,9 +401,10 @@ static class VpkMerge
         int exit;
         using (var proc = Process.Start(psi))
         {
-            // Read stdout and stderr together so neither buffer blocks
-            proc.OutputDataReceived += (_, e) => { if (e.Data != null) sb.AppendLine(e.Data); };
-            proc.ErrorDataReceived  += (_, e) => { if (e.Data != null) sb.AppendLine(e.Data); };
+            // Read stdout and stderr together so neither buffer blocks. The handlers run on
+            // separate threads and StringBuilder isn't thread-safe, so lock or lines get lost.
+            proc.OutputDataReceived += (_, e) => { if (e.Data != null) lock (sb) sb.AppendLine(e.Data); };
+            proc.ErrorDataReceived  += (_, e) => { if (e.Data != null) lock (sb) sb.AppendLine(e.Data); };
             proc.BeginOutputReadLine();
             proc.BeginErrorReadLine();
             proc.WaitForExit();
@@ -149,7 +450,13 @@ static class VpkMerge
             .Select(l => Regex.Match(l, @"^\s+(\S+)\s+stale:").Groups[1].Value)
             .ToArray();
 
-        return new CheckResult { ParseOk = true, IsStale = stale > 0, StaleModels = models };
+        var all = lines
+            .Select(l => Regex.Match(l, @"^\s+(\S+\.vmdl_c)\s"))
+            .Where(mm => mm.Success)
+            .Select(mm => mm.Groups[1].Value)
+            .ToArray();
+
+        return new CheckResult { ParseOk = true, IsStale = stale > 0, StaleModels = models, AllModels = all };
     }
 }
 
@@ -164,6 +471,7 @@ class CheckResult
     public bool ParseOk;
     public bool IsStale;
     public string[] StaleModels = new string[0];
+    public string[] AllModels   = new string[0];
 }
 
 // ---------------------------------------------------------------------------
@@ -235,12 +543,15 @@ class MainForm : Form
     private Button     _browseBtn;
     private Button     _scanBtn;
     private Button     _fixBtn;
+    private Button     _restoreBtn;
+    private Button     _reportBtn;
     private Label      _summaryLbl;
     private ProgressBar _progress;
     private Label      _progressLbl;
     private DataGridView _grid;
     private RichTextBox  _log;
     private LinkLabel    _siteLink;
+    private LinkLabel    _updateLink;
 
     // State
     private List<ModEntry> _mods = new List<ModEntry>();
@@ -249,13 +560,15 @@ class MainForm : Form
 
     // Grid column indices
     private const int ColMod    = 0;
-    private const int ColStatus = 1;
-    private const int ColModels = 2;
+    private const int ColHero   = 1;
+    private const int ColStatus = 2;
+    private const int ColModels = 3;
 
     public MainForm()
     {
         BuildUI();
         AutoDetectAddons();
+        Shown += (_, __) => CheckForUpdate();
     }
 
     // -----------------------------------------------------------------------
@@ -263,9 +576,9 @@ class MainForm : Form
     // -----------------------------------------------------------------------
     private void BuildUI()
     {
-        Text            = "Deadlocker Mod Fixer";
-        MinimumSize     = new Size(760, 580);
-        Size            = new Size(820, 660);
+        Text            = "Deadlocker Mod Fixer v" + AppInfo.Version;
+        MinimumSize     = new Size(820, 580);
+        Size            = new Size(900, 660);
         StartPosition   = FormStartPosition.CenterScreen;
         Font            = new Font("Segoe UI", 9f);
         BackColor       = Color.FromArgb(240, 240, 242);
@@ -332,21 +645,34 @@ class MainForm : Form
             LinkColor = Color.FromArgb(100, 180, 255),
             ActiveLinkColor = Color.White
         };
-        _siteLink.LinkClicked += (_, __) =>
-            Process.Start(new ProcessStartInfo("https://deadlocker.net") { UseShellExecute = true });
+        _siteLink.LinkClicked += (_, __) => OpenUrl(AppInfo.SiteUrl);
 
-        // Position site link on the right at runtime (needs form width)
-        Shown += (_, __) =>
+        // Shown only when a newer release exists (see CheckForUpdate)
+        _updateLink = new LinkLabel
         {
-            _siteLink.Left = header.Width - _siteLink.Width - 16;
-            _siteLink.Top  = (header.Height - _siteLink.Height) / 2;
+            Text      = "",
+            Font      = new Font("Segoe UI", 9f, FontStyle.Bold),
+            AutoSize  = true,
+            Visible   = false,
+            BackColor = Color.Transparent,
+            LinkColor = Color.FromArgb(255, 200, 60),
+            ActiveLinkColor = Color.White
         };
-        header.Resize += (_, __) =>
-        {
-            _siteLink.Left = header.Width - _siteLink.Width - 16;
-        };
+        _updateLink.LinkClicked += (_, __) => OpenUrl(AppInfo.ReleasesUrl);
 
-        header.Controls.AddRange(new Control[] { logo, titleLbl, subLbl, _siteLink });
+        // Position header links on the right at runtime (needs form width)
+        Action placeLinks = () =>
+        {
+            _siteLink.Left   = header.Width - _siteLink.Width - 16;
+            _siteLink.Top    = (header.Height - _siteLink.Height) / 2;
+            _updateLink.Left = _siteLink.Left - _updateLink.Width - 20;
+            _updateLink.Top  = _siteLink.Top;
+        };
+        Shown         += (_, __) => placeLinks();
+        header.Resize += (_, __) => placeLinks();
+        _updateLink.SizeChanged += (_, __) => placeLinks();
+
+        header.Controls.AddRange(new Control[] { logo, titleLbl, subLbl, _siteLink, _updateLink });
 
         // ── Path row ────────────────────────────────────────────────────────
         var pathPanel = new Panel
@@ -426,16 +752,38 @@ class MainForm : Form
         };
         _fixBtn.Click += FixClick;
 
+        _restoreBtn = new Button
+        {
+            Text      = "Restore Backup…",
+            Width     = 120,
+            Height    = 26,
+            Top       = 8,
+            Left      = 260,
+            FlatStyle = FlatStyle.System
+        };
+        _restoreBtn.Click += RestoreClick;
+
+        _reportBtn = new Button
+        {
+            Text      = "Copy Report",
+            Width     = 100,
+            Height    = 26,
+            Top       = 8,
+            Left      = 390,
+            FlatStyle = FlatStyle.System
+        };
+        _reportBtn.Click += CopyReportClick;
+
         _summaryLbl = new Label
         {
             Text      = "",
             AutoSize  = true,
             Top       = 14,
-            Left      = 264,
+            Left      = 504,
             ForeColor = Color.FromArgb(80, 80, 80)
         };
 
-        actionPanel.Controls.AddRange(new Control[] { _scanBtn, _fixBtn, _summaryLbl });
+        actionPanel.Controls.AddRange(new Control[] { _scanBtn, _fixBtn, _restoreBtn, _reportBtn, _summaryLbl });
 
         // ── Progress row (hidden until running) ─────────────────────────────
         var progPanel = new Panel
@@ -475,8 +823,10 @@ class MainForm : Form
             ForeColor = Color.FromArgb(200, 200, 200),
             Font      = new Font("Consolas", 8.5f),
             BorderStyle = BorderStyle.None,
-            ScrollBars = RichTextBoxScrollBars.Vertical
+            ScrollBars = RichTextBoxScrollBars.Vertical,
+            DetectUrls = true
         };
+        _log.LinkClicked += (_, e) => OpenUrl(e.LinkText);
         logPanel.Controls.AddRange(new Control[] { _log, logLbl });
 
         // ── Grid (fills remaining space) ────────────────────────────────────
@@ -510,6 +860,14 @@ class MainForm : Form
             Width     = 160,
             MinimumWidth = 120,
             DefaultCellStyle = { Font = new Font("Consolas", 8.5f) }
+        });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            Name       = "Hero",
+            HeaderText = "Hero",
+            Width      = 135,   // fits "(multi-hero pack)" and "Deadman Danny" on one line
+            MinimumWidth = 70,
+            DefaultCellStyle = { WrapMode = DataGridViewTriState.False }
         });
         _grid.Columns.Add(new DataGridViewTextBoxColumn
         {
@@ -622,7 +980,7 @@ class MainForm : Form
         // Populate grid
         _grid.Rows.Clear();
         foreach (var m in _mods)
-            _grid.Rows.Add(m.FileName, "Pending", "");
+            _grid.Rows.Add(m.FileName, "", "Pending", "");
 
         SetButtonsEnabled(false);
         _fixBtn.Enabled = false;
@@ -647,12 +1005,17 @@ class MainForm : Form
                 var mod = _mods[i];
                 _worker.ReportProgress(i, new object[] { "scanning", mod });
 
-                // Skip chunked mods
+                // Name the hero from the files inside the mod (also works for skipped mods)
+                try { mod.Hero = HeroNames.Describe(VpkDir.ListFiles(mod.FilePath)); }
+                catch { /* unreadable directory; fall back to the check output below */ }
+
+                // Skip mods split across several files (pakNN_000.vpk etc.)
                 var nm = Regex.Match(mod.FileName, @"^pak(\d+)_dir\.vpk$").Groups[1].Value;
                 if (chunkSet.Contains(nm))
                 {
                     mod.Status       = ModStatus.Skipped;
-                    mod.StatusDetail = "has sibling chunk files";
+                    mod.IsSplit      = true;
+                    mod.StatusDetail = "split across multiple files, not supported yet";
                     _worker.ReportProgress(i, new object[] { "done", mod });
                     continue;
                 }
@@ -688,6 +1051,9 @@ class MainForm : Form
                     continue;
                 }
 
+                // Fallback if the VPK's file list couldn't be read above
+                if (mod.Hero == "") mod.Hero = HeroNames.FromFiles(check.AllModels);
+
                 if (!check.IsStale)
                 {
                     mod.Status = ModStatus.Current;
@@ -717,17 +1083,13 @@ class MainForm : Form
             var mod = (ModEntry)data[1];
             if (type == "scanning")
             {
-                UpdateGridRow(idx, mod.FileName, "Scanning…", "");
+                UpdateGridRow(idx, mod, "Scanning…");
                 _progressLbl.Text = $"{idx + 1} / {_mods.Count}";
                 _progress.Value = idx + 1;
             }
             else // "done"
             {
-                string statusText = mod.Status.ToString();
-                string models     = string.Join("\n", mod.StaleModels);
-                if (!string.IsNullOrEmpty(mod.StatusDetail))
-                    statusText += " — " + mod.StatusDetail;
-                UpdateGridRow(idx, mod.FileName, statusText, models);
+                UpdateGridRow(idx, mod);
                 _grid.InvalidateRow(idx);
             }
         };
@@ -753,18 +1115,7 @@ class MainForm : Form
     private void FixClick(object sender, EventArgs e)
     {
         if (!ValidatePaths()) return;
-
-        // Warn if game is running
-        var running = new[] { "project8", "DeadlockModManager", "CitadelModManager" }
-            .Where(n => Process.GetProcessesByName(n).Length > 0).ToArray();
-        if (running.Length > 0)
-        {
-            var msg = "The following processes are running:\n  " + string.Join(", ", running)
-                    + "\n\nReplacing VPK files while Deadlock is open can cause crashes.\n\nContinue anyway?";
-            if (MessageBox.Show(this, msg, "Deadlock is running",
-                    MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
-                return;
-        }
+        if (!ConfirmGameNotRunning()) return;
 
         var confirm = MessageBox.Show(this,
             $"This will heal {_mods.Count(m => m.Status == ModStatus.Stale)} stale mod(s).\n\n" +
@@ -882,8 +1233,7 @@ class MainForm : Form
             else if (type == "scanning")
             {
                 var modIdx = (int)data[1];
-                var name   = _mods[modIdx].FileName;
-                UpdateGridRow(modIdx, name, "Fixing…", "");
+                UpdateGridRow(modIdx, _mods[modIdx], "Fixing…");
                 _progressLbl.Text = $"{args.ProgressPercentage + 1} / {staleList.Count}";
                 _progress.Value   = args.ProgressPercentage + 1;
             }
@@ -891,10 +1241,7 @@ class MainForm : Form
             {
                 var modIdx = (int)data[1];
                 var mod    = (ModEntry)data[2];
-                string statusText = mod.Status.ToString();
-                if (!string.IsNullOrEmpty(mod.StatusDetail)) statusText += " — " + mod.StatusDetail;
-                string models = string.Join("\n", mod.StaleModels);
-                UpdateGridRow(modIdx, mod.FileName, statusText, models);
+                UpdateGridRow(modIdx, mod);
                 _grid.InvalidateRow(modIdx);
                 LogLine(mod.Status == ModStatus.Fixed
                     ? $"  FIXED: {mod.FileName}"
@@ -917,8 +1264,10 @@ class MainForm : Form
             {
                 var bDir = Path.Combine(BackupsRoot, _backupTimestamp);
                 LogLine($"Originals backed up to:\n  {bDir}", Color.FromArgb(160, 160, 255));
+                LogLine($"Check {AppInfo.SiteUrl} for official updates to your mods.", Color.White);
                 MessageBox.Show(this,
-                    $"{fixed_} mod(s) fixed successfully.\n\nOriginals backed up to:\n{bDir}",
+                    $"Fixed {fixed_} mod(s). Check deadlocker.net for official updates to your mods.\n\n" +
+                    $"Originals backed up to:\n{bDir}\n\nUse \"Restore Backup…\" to undo.",
                     "Fix Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             else if (errors > 0)
@@ -952,23 +1301,278 @@ class MainForm : Form
                 "Base Pak Missing", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return false;
         }
-        try { var _ = VpkMerge.ExePath; }
+        // First run without vpkmerge next to the app downloads it (~9 MB) on the UI thread
+        var downloading = VpkMerge.NeedsDownload;
+        if (downloading)
+        {
+            LogLine("Downloading vpkmerge v" + VpkMerge.Version + " from github.com/Slush97/vpkmerge…", Color.White);
+            _log.Refresh();
+            UseWaitCursor = true;
+        }
+        try
+        {
+            var _ = VpkMerge.ExePath;
+            if (downloading)
+                LogLine("vpkmerge downloaded and SHA-256 verified.", Color.FromArgb(100, 200, 100));
+        }
         catch (Exception ex)
         {
+            VpkMerge.Verified = false;
+            LogLine(ex.Message, Color.FromArgb(255, 100, 100));
             MessageBox.Show(this, ex.Message, "vpkmerge.exe Missing",
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
             return false;
         }
+        finally { UseWaitCursor = false; }
         return true;
     }
 
-    private void UpdateGridRow(int idx, string mod, string status, string models)
+    private bool ConfirmGameNotRunning()
+    {
+        var running = new[] { "project8", "DeadlockModManager", "CitadelModManager" }
+            .Where(n => Process.GetProcessesByName(n).Length > 0).ToArray();
+        if (running.Length == 0) return true;
+
+        var msg = "The following processes are running:\n  " + string.Join(", ", running)
+                + "\n\nReplacing VPK files while Deadlock is open can cause crashes.\n\nContinue anyway?";
+        return MessageBox.Show(this, msg, "Deadlock is running",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes;
+    }
+
+    private static void OpenUrl(string url)
+    {
+        try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); }
+        catch { /* no browser configured */ }
+    }
+
+    // -----------------------------------------------------------------------
+    // RESTORE
+    // -----------------------------------------------------------------------
+    private void RestoreClick(object sender, EventArgs e)
+    {
+        var backups = Directory.Exists(BackupsRoot)
+            ? new DirectoryInfo(BackupsRoot).GetDirectories()
+                .Select(d => new { Dir = d, Paks = d.GetFiles("pak*_dir.vpk") })
+                .Where(b => b.Paks.Length > 0)
+                .OrderByDescending(b => b.Dir.Name)
+                .ToList()
+            : null;
+
+        if (backups == null || backups.Count == 0)
+        {
+            MessageBox.Show(this, "No backups found yet.\n\nBackups are made automatically when you fix mods.",
+                "Restore Backup", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        string chosen = null;
+        using (var dlg = new Form
+        {
+            Text            = "Restore Backup",
+            Size            = new Size(520, 340),
+            MinimumSize     = new Size(400, 260),
+            StartPosition   = FormStartPosition.CenterParent,
+            Font            = Font,
+            ShowInTaskbar   = false,
+            MinimizeBox     = false,
+            MaximizeBox     = false
+        })
+        {
+            var info = new Label
+            {
+                Text   = "Pick a backup. Its original mod files will be copied back into your addons folder.",
+                Dock   = DockStyle.Top,
+                Height = 36,
+                Padding = new Padding(8, 8, 8, 0)
+            };
+            var list = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false };
+            foreach (var b in backups)
+            {
+                DateTime when;
+                var label = DateTime.TryParseExact(b.Dir.Name, "yyyy-MM-dd_HHmm", null,
+                        System.Globalization.DateTimeStyles.None, out when)
+                    ? when.ToString("yyyy-MM-dd HH:mm") : b.Dir.Name;
+                var paks = string.Join(", ", b.Paks.Select(p => p.Name.Replace("_dir.vpk", "")));
+                list.Items.Add($"{label}  —  {b.Paks.Length} mod(s) ({paks})");
+            }
+            list.SelectedIndex = 0;
+
+            var bottom = new Panel { Dock = DockStyle.Bottom, Height = 40 };
+            var openLink = new LinkLabel { Text = "Open backups folder", AutoSize = true, Left = 8, Top = 12 };
+            openLink.LinkClicked += (_, __) => OpenUrl(BackupsRoot);
+            var ok     = new Button { Text = "Restore", Width = 90, Height = 26, Top = 7, FlatStyle = FlatStyle.System,
+                                     DialogResult = DialogResult.OK, Anchor = AnchorStyles.Top | AnchorStyles.Right };
+            var cancel = new Button { Text = "Cancel", Width = 80, Height = 26, Top = 7, FlatStyle = FlatStyle.System,
+                                     DialogResult = DialogResult.Cancel, Anchor = AnchorStyles.Top | AnchorStyles.Right };
+            bottom.Controls.AddRange(new Control[] { openLink, ok, cancel });
+            bottom.Layout += (_, __) =>
+            {
+                cancel.Left = bottom.ClientSize.Width - cancel.Width - 8;
+                ok.Left     = cancel.Left - ok.Width - 6;
+            };
+            list.DoubleClick += (_, __) => { dlg.DialogResult = DialogResult.OK; };
+
+            dlg.Controls.Add(list);
+            dlg.Controls.Add(bottom);
+            dlg.Controls.Add(info);
+            dlg.AcceptButton = ok;
+            dlg.CancelButton = cancel;
+
+            if (dlg.ShowDialog(this) != DialogResult.OK || list.SelectedIndex < 0) return;
+            chosen = backups[list.SelectedIndex].Dir.FullName;
+        }
+
+        var addons = _addonsBox.Text.Trim();
+        if (!Directory.Exists(addons))
+        {
+            MessageBox.Show(this, "Addons folder not found:\n" + addons,
+                "Invalid Path", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        var files = Directory.GetFiles(chosen, "pak*_dir.vpk");
+        if (MessageBox.Show(this,
+                $"Restore {files.Length} mod file(s) from\n{chosen}\n\ninto\n{addons}?\n\n" +
+                "The current versions of these files will be overwritten.",
+                "Confirm Restore", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
+            return;
+        if (!ConfirmGameNotRunning()) return;
+
+        LogLine($"\nRestoring backup {Path.GetFileName(chosen)}...", Color.White);
+        int restored = 0, failed = 0;
+        foreach (var f in files)
+        {
+            try
+            {
+                File.Copy(f, Path.Combine(addons, Path.GetFileName(f)), true);
+                LogLine("  RESTORED: " + Path.GetFileName(f), Color.FromArgb(100, 200, 100));
+                restored++;
+            }
+            catch (Exception ex)
+            {
+                LogLine($"  ERROR: {Path.GetFileName(f)} — {ex.Message}", Color.FromArgb(255, 100, 100));
+                failed++;
+            }
+        }
+        LogLine($"Restore complete: {restored} restored, {failed} failed.", Color.White);
+
+        MessageBox.Show(this, $"Restored {restored} mod file(s)" + (failed > 0 ? $", {failed} failed. Check the log." : "."),
+            "Restore Complete", MessageBoxButtons.OK,
+            failed > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+
+        if (restored > 0 && File.Exists(BasePak))
+            ScanClick(this, EventArgs.Empty);
+    }
+
+    // -----------------------------------------------------------------------
+    // COPY REPORT - details for bug reports on Reddit/GitHub
+    // -----------------------------------------------------------------------
+    private void CopyReportClick(object sender, EventArgs e)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("### Deadlocker Mod Fixer report");
+        sb.AppendLine($"- Fixer version: {AppInfo.Version}");
+        sb.AppendLine($"- vpkmerge: v{VpkMerge.Version}, " +
+            (VpkMerge.Verified == true ? "SHA-256 verified"
+             : VpkMerge.Verified == false ? "NOT found / failed verification" : "not checked yet"));
+        sb.AppendLine($"- Windows: {WindowsVersion()} ({(Environment.Is64BitOperatingSystem ? "64" : "32")}-bit)");
+        sb.AppendLine($"- Addons folder: {_addonsBox.Text}");
+        sb.AppendLine($"- Base pak found: {(File.Exists(BasePak) ? "yes" : "no")}");
+        sb.AppendLine();
+
+        if (_mods.Count > 0)
+        {
+            sb.AppendLine("| Mod | Hero | Status | Affected models |");
+            sb.AppendLine("|---|---|---|---|");
+            foreach (var m in _mods)
+                sb.AppendLine($"| {m.FileName} | {m.Hero} | {StatusText(m)} | {string.Join("<br>", m.StaleModels)} |");
+            sb.AppendLine();
+        }
+
+        sb.AppendLine("<details><summary>Log</summary>");
+        sb.AppendLine();
+        sb.AppendLine("```");
+        sb.AppendLine(_log.Text.TrimEnd());
+        sb.AppendLine("```");
+        sb.AppendLine("</details>");
+
+        try
+        {
+            Clipboard.SetText(sb.ToString());
+            LogLine("Report copied to clipboard. Paste it into your Reddit or GitHub post.", Color.FromArgb(160, 160, 255));
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, "Couldn't copy to the clipboard: " + ex.Message,
+                "Copy Report", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // UPDATE CHECK - asks GitHub for the latest release, silent on any failure
+    // -----------------------------------------------------------------------
+    private void CheckForUpdate()
+    {
+        var t = new Thread(() =>
+        {
+            try
+            {
+                AppInfo.EnableTls12();
+                var req = (HttpWebRequest)WebRequest.Create(
+                    "https://api.github.com/repos/" + AppInfo.Repo + "/releases/latest");
+                req.UserAgent = "DeadlockerModFixer/" + AppInfo.Version;
+                req.Accept    = "application/vnd.github+json";
+                req.Timeout   = 5000;
+                string json;
+                using (var resp = req.GetResponse())
+                using (var rd   = new StreamReader(resp.GetResponseStream()))
+                    json = rd.ReadToEnd();
+
+                var tag = Regex.Match(json, @"""tag_name""\s*:\s*""v?([0-9][0-9.]*)""").Groups[1].Value;
+                Version latest;
+                if (!Version.TryParse(tag, out latest)) return;
+                if (latest <= new Version(AppInfo.Version)) return;
+
+                BeginInvoke(new Action(() =>
+                {
+                    _updateLink.Text    = $"New version v{tag} available";
+                    _updateLink.Visible = true;
+                    LogLine($"New version v{tag} available: {AppInfo.ReleasesUrl}", Color.FromArgb(255, 200, 60));
+                }));
+            }
+            catch { /* offline, rate-limited, etc. - not worth bothering the user */ }
+        });
+        t.IsBackground = true;
+        t.Start();
+    }
+
+    // Environment.OSVersion reports 6.2 on Windows 10/11 without an app manifest; ask the registry
+    private static string WindowsVersion()
+    {
+        const string key = @"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+        var build   = Registry.GetValue(key, "CurrentBuild", null) as string;
+        var display = Registry.GetValue(key, "DisplayVersion", null) as string;
+        if (build == null) return Environment.OSVersion.VersionString;
+        int b;
+        var name = int.TryParse(build, out b) && b >= 22000 ? "Windows 11" : "Windows 10";
+        return $"{name} {display} (build {build})".Replace("  ", " ");
+    }
+
+    private static string StatusText(ModEntry mod)
+    {
+        var s = mod.Status.ToString();
+        if (!string.IsNullOrEmpty(mod.StatusDetail)) s += " — " + mod.StatusDetail;
+        return s;
+    }
+
+    private void UpdateGridRow(int idx, ModEntry mod, string statusOverride = null)
     {
         if (_grid.Rows.Count <= idx) return;
         var row = _grid.Rows[idx];
-        row.Cells[ColMod].Value    = mod;
-        row.Cells[ColStatus].Value = status;
-        row.Cells[ColModels].Value = models;
+        row.Cells[ColMod].Value    = mod.FileName;
+        row.Cells[ColHero].Value   = mod.Hero;
+        row.Cells[ColStatus].Value = statusOverride ?? StatusText(mod);
+        row.Cells[ColModels].Value = statusOverride != null ? "" : string.Join("\n", mod.StaleModels);
     }
 
     private void UpdateSummary()
@@ -977,12 +1581,14 @@ class MainForm : Form
         var stale   = _mods.Count(m => m.Status == ModStatus.Stale);
         var fixed_  = _mods.Count(m => m.Status == ModStatus.Fixed);
         var errors  = _mods.Count(m => m.Status == ModStatus.Error);
-        var skipped = _mods.Count(m => m.Status == ModStatus.Skipped);
+        var split   = _mods.Count(m => m.Status == ModStatus.Skipped && m.IsSplit);
+        var skipped = _mods.Count(m => m.Status == ModStatus.Skipped && !m.IsSplit);
 
         var parts = new List<string>();
         if (current  > 0) parts.Add($"{current} current");
         if (stale    > 0) parts.Add($"{stale} stale");
         if (fixed_   > 0) parts.Add($"{fixed_} fixed");
+        if (split    > 0) parts.Add($"{split} split (not supported yet)");
         if (skipped  > 0) parts.Add($"{skipped} skipped");
         if (errors   > 0) parts.Add($"{errors} errors");
         _summaryLbl.Text = string.Join("  |  ", parts);
@@ -990,8 +1596,10 @@ class MainForm : Form
 
     private void SetButtonsEnabled(bool enabled)
     {
-        _scanBtn.Enabled   = enabled;
-        _browseBtn.Enabled = enabled;
+        _scanBtn.Enabled    = enabled;
+        _restoreBtn.Enabled = enabled;
+        _reportBtn.Enabled  = enabled;
+        _browseBtn.Enabled  = enabled;
         _addonsBox.Enabled = enabled;
     }
 
