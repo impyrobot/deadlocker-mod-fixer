@@ -162,6 +162,22 @@ problems or report it on the deadlocker.net Discord.
 
 ---
 
+## Privacy & code signing
+
+**Privacy:** the Mod Fixer sends no personal data, telemetry or analytics. It only connects to
+GitHub, to check for a newer version and to download vpkmerge on the first scan. It only changes
+files in your Deadlock addons folder and its own backup folder. Full details are in the
+[privacy section](https://github.com/impyrobot/deadlocker-mod-fixer#privacy).
+
+**Code signing policy:** Free code signing provided by [SignPath.io](https://about.signpath.io/),
+certificate by [SignPath Foundation](https://signpath.org/) *(application pending; current
+releases are unsigned)*. Release builds are made from the
+[public source code](https://github.com/impyrobot/deadlocker-mod-fixer) by GitHub Actions. Team
+roles and the full policy are in the
+[code signing policy](https://github.com/impyrobot/deadlocker-mod-fixer#code-signing-policy).
+
+---
+
 ## Credits
 
 The actual scanning and repair work is done by **[vpkmerge](https://github.com/Slush97/vpkmerge)**
